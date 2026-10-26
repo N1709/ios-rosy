@@ -12,10 +12,10 @@ index de8484d..4b430ef 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
 new file mode 100644
-index 0000000..e2699d7
+index 0000000..83cd8d9
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
-@@ -0,0 +1,928 @@
+@@ -0,0 +1,919 @@
 +/*
 + * Xiaomi Redmi 5 Plus (vince) Adreno 506 GPU bringup driver.
 + *
@@ -525,16 +525,7 @@ index 0000000..e2699d7
 +		}
 +	}
 +
-+	/* 1. Setup VBIF round-robin QoS arbitration (Freedreno a5xx_hw_init) */
-+	reg_write(gpu_va, REG_A5XX_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003u);
-+
-+	/* 2. Enable RBBM error reporting */
-+	reg_write(gpu_va, REG_A5XX_RBBM_AHB_CNTL0, 0x00000001u);
-+
-+	/* 3. For A506 non-ZAP operation: drop secure trust control to non-secure */
-+	reg_write(gpu_va, REG_A5XX_RBBM_SECVID_TRUST_CNTL, 0x00000000u);
-+
-+	/* 4. Read core status registers */
++	/* read-only probe; the setup writes are step 7, and SECVID_TRUST_CNTL is left to the zap (step 10) */
 +	ahb_cntl = reg_read(gpu_va, REG_A5XX_RBBM_AHB_CNTL0);
 +	status   = reg_read(gpu_va, REG_A5XX_RBBM_STATUS);
 +	status3  = reg_read(gpu_va, REG_A5XX_RBBM_STATUS3);
@@ -856,8 +847,8 @@ index 0000000..e2699d7
 +	if (!rb_flush("CP_SET_SECURE_MODE")) {
 +		return false;
 +	}
-+	printf("adreno: step 10: zap loaded, GPU out of secure mode (SECVID_TRUST_CNTL=%#x)\n",
-+	    gr(A5_RBBM_SECVID_TRUST_CNTL));
++	/* RBBM_SECVID_TRUST_CNTL is a secure register once the zap is in: a CPU read of it is an external abort */
++	printf("adreno: step 10: zap loaded, GPU out of secure mode\n");
 +	return true;
 +}
 +
