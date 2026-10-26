@@ -12,10 +12,10 @@ index de8484d..4b430ef 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
 new file mode 100644
-index 0000000..0c2bc15
+index 0000000..67d06c5
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,707 @@
 +/*
 + * Xiaomi Redmi 5 Plus (vince) Adreno 506 GPU bringup driver.
 + *
@@ -79,11 +79,6 @@ index 0000000..0c2bc15
 +#define GCC_CLAMP_IO_CTRL       0x5b00cu
 +
 +/* GFX LDO & Power Switch Registers (0x0185f000 per Qualcomm msm_gfx_ldo driver) */
-+#define GCC_GFX_LDO_ATEST           0x5f000u
-+#define GCC_GFX_LDO_CFG0            0x5f004u
-+#define GCC_GFX_LDO_CFG1            0x5f008u
-+#define GCC_GFX_LDO_CFG2            0x5f00cu
-+#define GCC_GFX_LDO_VREF_TEST_CFG   0x5f014u
 +#define GCC_GFX_PWRSWITCH_CTRL      0x5f01cu
 +#define GCC_GFX_PWRSWITCH_STATUS    0x5f028u
 +
@@ -127,6 +122,15 @@ index 0000000..0c2bc15
 +#define ARGS_THREE_VALUES       0x03ull /* 3 plain values */
 +#define SCM_INTERRUPTED         1
 +#define PAS_GPU                 13
++
++/*
++ * TZ MP service restore_sec_cfg (svc 0x0C cmd 2), in the plain FNID form the shim proved on this phone.
++ * Without it every access to the GPU's register space is a synchronous external abort; mainline makes the same
++ * call for the GPU IOMMU (qcom,iommu-secure-id = 18) whenever OXILI_CX_GDSC comes up (qcom_iommu.c).
++ */
++#define SCM_MP_RESTORE_SEC_CFG  0x02000C02ull
++#define ARGS_TWO_PLAIN          0x02ull
++#define GPU_IOMMU_SEC_ID        18
 +
 +#define STEPS 11
 +
@@ -342,21 +346,10 @@ index 0000000..0c2bc15
 +	/* 3. Retain GMEM memory and peripheral logic across power switches (gdsc_force_mem_on) */
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (3u << 13));
 +
-+	/* 4. Configure Qualcomm GFX LDO per msm_gfx_ldo driver specification */
-+	reg_write(gcc_va, GCC_GFX_LDO_ATEST, 0x00000203u);
-+	reg_write(gcc_va, GCC_GFX_LDO_CFG0,  0x05008600u);
-+	reg_write(gcc_va, GCC_GFX_LDO_CFG1,  0x00000000u);
-+	reg_write(gcc_va, GCC_GFX_LDO_CFG2,  0x0000c3fcu);
-+	reg_write(gcc_va, GCC_GFX_LDO_VREF_TEST_CFG, 0x004b1102u);
-+
-+	/* 5. Deassert GFX LDO Clamp IO, enable CPR in auto-bypass, configure BHS mode */
-+	pwr_ctl = reg_read(gcc_va, GCC_GFX_PWRSWITCH_CTRL);
-+	pwr_ctl &= ~(1u << 31); /* Clear LDO_CLAMP_IO_BIT (bit 31) */
-+	pwr_ctl |= (1u << 29);  /* Set EN_LDOAP_CTRL_CPR_BIT (bit 29) */
-+	pwr_ctl &= ~((1u << 9) | (1u << 30) | (1u << 0) | (1u << 1) | (1u << 2)); /* BHS mode */
-+	pwr_ctl |= (1u << 4);   /* LDO_UNDER_SW_CTRL */
-+	reg_write(gcc_va, GCC_GFX_PWRSWITCH_CTRL, pwr_ctl);
-+
++	/*
++	 * The GFX LDO block (0x0185f000) is left as LK set it: mainline never touches it and the GPU registers
++	 * read fine there with PWRSWITCH_CTRL still 0x80000038 (ground truth, 2026-10-26).
++	 */
 +	pwr_ctl = reg_read(gcc_va, GCC_GFX_PWRSWITCH_CTRL);
 +	pwr_stat = reg_read(gcc_va, GCC_GFX_PWRSWITCH_STATUS);
 +
@@ -467,8 +460,20 @@ index 0000000..0c2bc15
 +	uint32_t ahb_cntl, status, status3, vbif_ver, int0;
 +	uint32_t gfx_cbcr = reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR);
 +
++	uint64_t ans = 0;
++	int32_t sret;
++
 +	printf("adreno: step 6: probing Adreno 506 hardware registers (GFX_CBCR=%#x, CLK_OFF=%u)\n",
 +	    gfx_cbcr, (gfx_cbcr >> 31) & 1u);
++
++	/* TZ must restore the GPU's secure configuration after CX comes up, or the first access aborts */
++	sret = vince_scm_invoke("RESTORE_SEC_CFG(GPU IOMMU)", SCM_MP_RESTORE_SEC_CFG, ARGS_TWO_PLAIN,
++	    GPU_IOMMU_SEC_ID, 0, 0, &ans);
++	printf("adreno: step 6: restore_sec_cfg(%d, 0) -> ret=%d ans=%#llx\n", GPU_IOMMU_SEC_ID, sret, ans);
++	if (sret != 0) {
++		printf("adreno: step 6: TZ refused restore_sec_cfg, NOT touching GPU registers\n");
++		return false;
++	}
 +
 +	if (!gpu_va) {
 +		gpu_va = ml_io_map(GPU_CORE_BASE_PA, GPU_CORE_SIZE);
@@ -497,7 +502,7 @@ index 0000000..0c2bc15
 +	printf("adreno: step 6: RBBM_AHB_CNTL0=%#x RBBM_STATUS=%#x STATUS3=%#x INT0=%#x VBIF_VER=%#x\n",
 +	    ahb_cntl, status, status3, int0, vbif_ver);
 +
-+	printf("adreno: step 6: >>> ADRENO 506 HARDWARE ACCELERATION ACCESSIBLE! <<<\n");
++	printf("adreno: step 6: GPU register space readable (VBIF_VERSION should be 0x200d0000)\n");
 +	return true;
 +}
 +
@@ -526,8 +531,8 @@ index 0000000..0c2bc15
 +	vm_offset_t pa;
 +	int32_t ret;
 +
-+	/* NOTE: Do NOT call PAS_SHUTDOWN here. On A506, PAS_SHUTDOWN enables
-+	 * TrustZone XPU firewall lock which blocks MMIO registers permanently. */
++	/* No PAS_SHUTDOWN here: nothing is running under PAS id 13 yet. (The register aborts once blamed on it were
++	 * the missing restore_sec_cfg, see step 6.) */
 +
 +	printf("adreno: step 8: authenticating Zap shader header (%u bytes)\n", a506_zap_mdt_size);
 +	clean_range((vm_offset_t)&a506_zap_mdt[0], a506_zap_mdt_size);
