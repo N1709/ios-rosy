@@ -12,10 +12,10 @@ index de8484d..4b430ef 100644
  bsd/dev/unix_startup.c			standard
 diff --git a/bsd/dev/vince_adreno.c b/bsd/dev/vince_adreno.c
 new file mode 100644
-index 0000000..c637e25
+index 0000000..0c2bc15
 --- /dev/null
 +++ b/bsd/dev/vince_adreno.c
-@@ -0,0 +1,678 @@
+@@ -0,0 +1,702 @@
 +/*
 + * Xiaomi Redmi 5 Plus (vince) Adreno 506 GPU bringup driver.
 + *
@@ -23,7 +23,7 @@ index 0000000..c637e25
 + *   1  reads   GCC clocks & GDSC status
 + *   2  reads   QFPROM speed bin & chip ID fuses
 + *   3  writes  OXILI_CX_GDSC power on
-+ *   4  writes  OXILI_GX_GDSC power on (and clamp deassert)
++ *   4  writes  OXILI_GX_GDSC power on, GFX LDO / BHS config & deasserts all IO clamps
 + *   5  writes  GCC OXILI branch clocks on (AHB, GFX3D, GMEM, BIMC, AON, TIMER)
 + *   6  reads   Adreno 506 hardware registers (pre-ZAP direct verification & non-secure unlock)
 + *   7  asks    TrustZone SCM if PAS_GPU (13) authentication is supported
@@ -66,6 +66,7 @@ index 0000000..c637e25
 +/* GCC Registers */
 +#define GCC_GFX3D_CMD_RCGR      0x59000u
 +#define GCC_GFX3D_CFG_RCGR      0x59004u
++#define GCC_OXILI_BCR           0x59018u
 +#define GCC_OXILI_GX_GDSCR      0x5901cu
 +#define GCC_OXILI_GFX3D_CBCR    0x59020u
 +#define GCC_OXILI_GMEM_CBCR     0x59024u
@@ -76,6 +77,15 @@ index 0000000..c637e25
 +#define GCC_OXILI_AON_CBCR      0x59044u
 +#define GCC_OXILI_CX_GDSCR      0x5904cu
 +#define GCC_CLAMP_IO_CTRL       0x5b00cu
++
++/* GFX LDO & Power Switch Registers (0x0185f000 per Qualcomm msm_gfx_ldo driver) */
++#define GCC_GFX_LDO_ATEST           0x5f000u
++#define GCC_GFX_LDO_CFG0            0x5f004u
++#define GCC_GFX_LDO_CFG1            0x5f008u
++#define GCC_GFX_LDO_CFG2            0x5f00cu
++#define GCC_GFX_LDO_VREF_TEST_CFG   0x5f014u
++#define GCC_GFX_PWRSWITCH_CTRL      0x5f01cu
++#define GCC_GFX_PWRSWITCH_STATUS    0x5f028u
 +
 +/* Crypto Engine Clock Registers (Required by TrustZone PAS authentication) */
 +#define GCC_CRYPTO_CMD_RCGR     0x16004u
@@ -232,7 +242,7 @@ index 0000000..c637e25
 +static bool
 +step1_read_clocks(void)
 +{
-+	uint32_t cx, gx, ahb, gfx, gmem, cmd, cfg, gpll;
++	uint32_t cx, gx, ahb, gfx, cmd, cfg, gpll;
 +
 +	printf("adreno: step 1: reading GCC clock controller\n");
 +	if (!gcc_va) {
@@ -246,12 +256,11 @@ index 0000000..c637e25
 +	gx = reg_read(gcc_va, GCC_OXILI_GX_GDSCR);
 +	ahb = reg_read(gcc_va, GCC_OXILI_AHB_CBCR);
 +	gfx = reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR);
-+	gmem = reg_read(gcc_va, GCC_OXILI_GMEM_CBCR);
 +	cmd = reg_read(gcc_va, GCC_GFX3D_CMD_RCGR);
 +	cfg = reg_read(gcc_va, GCC_GFX3D_CFG_RCGR);
 +	gpll = reg_read(gcc_va, GCC_APCS_GPLL_ENA_VOTE);
-+	printf("adreno: step 1: CX_GDSC=%#x GX_GDSC=%#x AHB_CLK=%#x GFX_CLK=%#x GMEM_CLK=%#x (CMD=%#x CFG=%#x GPLL_VOTE=%#x)\n",
-+	    cx, gx, ahb, gfx, gmem, cmd, cfg, gpll);
++	printf("adreno: step 1: CX_GDSC=%#x GX_GDSC=%#x AHB_CLK=%#x GFX_CLK=%#x (CMD=%#x CFG=%#x GPLL_VOTE=%#x)\n",
++	    cx, gx, ahb, gfx, cmd, cfg, gpll);
 +	return true;
 +}
 +
@@ -301,16 +310,19 @@ index 0000000..c637e25
 +	return false;
 +}
 +
-+/* Step 4: Power OXILI_GX_GDSC & Deassert Clamp */
++/* Step 4: Power OXILI_GX_GDSC, Configure GFX LDO & Deassert All Clamps */
 +static bool
 +step4_power_gx(void)
 +{
-+	uint32_t val;
++	uint32_t val, pwr_ctl, pwr_stat;
 +	int i;
 +
-+	printf("adreno: step 4: powering OXILI_GX_GDSC & deasserting clamp\n");
++	printf("adreno: step 4: powering OXILI_GX_GDSC & deasserting IO clamps\n");
++
++	/* 1. Deassert GMEM / GX domain clamp */
 +	reg_write(gcc_va, GCC_CLAMP_IO_CTRL, reg_read(gcc_va, GCC_CLAMP_IO_CTRL) & ~1u);
 +
++	/* 2. Power on OXILI_GX_GDSC */
 +	val = reg_read(gcc_va, GCC_OXILI_GX_GDSCR);
 +	if (!(val & GDSC_PWR_ON)) {
 +		reg_write(gcc_va, GCC_OXILI_GX_GDSCR, val & ~GDSC_SW_COLLAPSE);
@@ -326,13 +338,32 @@ index 0000000..c637e25
 +		printf("adreno: step 4: OXILI_GX_GDSC timed out (%#x)\n", val);
 +		return false;
 +	}
-+	printf("adreno: step 4: OXILI_GX_GDSC powered on (%#x)\n", val);
 +
-+	/* Retain GMEM memory and peripheral logic across power switches (gdsc_force_mem_on) */
++	/* 3. Retain GMEM memory and peripheral logic across power switches (gdsc_force_mem_on) */
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (3u << 13));
-+	reg_write(gcc_va, GCC_OXILI_GMEM_CBCR, reg_read(gcc_va, GCC_OXILI_GMEM_CBCR) | (3u << 13));
 +
-+	delay(10);
++	/* 4. Configure Qualcomm GFX LDO per msm_gfx_ldo driver specification */
++	reg_write(gcc_va, GCC_GFX_LDO_ATEST, 0x00000203u);
++	reg_write(gcc_va, GCC_GFX_LDO_CFG0,  0x05008600u);
++	reg_write(gcc_va, GCC_GFX_LDO_CFG1,  0x00000000u);
++	reg_write(gcc_va, GCC_GFX_LDO_CFG2,  0x0000c3fcu);
++	reg_write(gcc_va, GCC_GFX_LDO_VREF_TEST_CFG, 0x004b1102u);
++
++	/* 5. Deassert GFX LDO Clamp IO, enable CPR in auto-bypass, configure BHS mode */
++	pwr_ctl = reg_read(gcc_va, GCC_GFX_PWRSWITCH_CTRL);
++	pwr_ctl &= ~(1u << 31); /* Clear LDO_CLAMP_IO_BIT (bit 31) */
++	pwr_ctl |= (1u << 29);  /* Set EN_LDOAP_CTRL_CPR_BIT (bit 29) */
++	pwr_ctl &= ~((1u << 9) | (1u << 30) | (1u << 0) | (1u << 1) | (1u << 2)); /* BHS mode */
++	pwr_ctl |= (1u << 4);   /* LDO_UNDER_SW_CTRL */
++	reg_write(gcc_va, GCC_GFX_PWRSWITCH_CTRL, pwr_ctl);
++
++	pwr_ctl = reg_read(gcc_va, GCC_GFX_PWRSWITCH_CTRL);
++	pwr_stat = reg_read(gcc_va, GCC_GFX_PWRSWITCH_STATUS);
++
++	printf("adreno: step 4: OXILI_GX_GDSC on (%#x), PWRSWITCH_CTRL=%#x, PWRSWITCH_STATUS=%#x\n",
++	    val, pwr_ctl, pwr_stat);
++
++	delay(50);
 +	return true;
 +}
 +
@@ -341,9 +372,9 @@ index 0000000..c637e25
 +step5_enable_clocks(void)
 +{
 +	int i;
-+	uint32_t gfx_cbcr, ahb_cbcr, gmem_cbcr;
++	uint32_t gfx_cbcr, ahb_cbcr;
 +
-+	printf("adreno: step 5: enabling GCC OXILI, GMEM, BIMC and Crypto branch clocks\n");
++	printf("adreno: step 5: enabling GCC OXILI, BIMC and Crypto branch clocks\n");
 +
 +	/* 1. Ensure GPLL0 active vote */
 +	reg_write(gcc_va, GCC_APCS_GPLL_ENA_VOTE, reg_read(gcc_va, GCC_APCS_GPLL_ENA_VOTE) | 1u);
@@ -372,14 +403,16 @@ index 0000000..c637e25
 +	/* Enable Root */
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 1));
 +
-+	/* 3. Turn on OXILI, GMEM, and BIMC GPU branch clocks */
++	/* 3. Turn on OXILI and BIMC GPU branch clocks */
 +	reg_write(gcc_va, GCC_OXILI_AHB_CBCR, reg_read(gcc_va, GCC_OXILI_AHB_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_GFX3D_CBCR, reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_OXILI_GMEM_CBCR, reg_read(gcc_va, GCC_OXILI_GMEM_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_BIMC_GPU_CBCR, reg_read(gcc_va, GCC_BIMC_GPU_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_BIMC_GFX_CBCR, reg_read(gcc_va, GCC_BIMC_GFX_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_AON_CBCR, reg_read(gcc_va, GCC_OXILI_AON_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_TIMER_CBCR, reg_read(gcc_va, GCC_OXILI_TIMER_CBCR) | 1u);
++
++	/* Deassert block reset */
++	reg_write(gcc_va, GCC_OXILI_BCR, 0u);
 +
 +	/* Wait for branch clocks CLK_OFF (bit 31) to clear */
 +	for (i = 0; i < 1000; i++) {
@@ -390,12 +423,6 @@ index 0000000..c637e25
 +	}
 +	for (i = 0; i < 1000; i++) {
 +		if (!(reg_read(gcc_va, GCC_OXILI_AHB_CBCR) & (1u << 31))) {
-+			break;
-+		}
-+		delay(2);
-+	}
-+	for (i = 0; i < 1000; i++) {
-+		if (!(reg_read(gcc_va, GCC_OXILI_GMEM_CBCR) & (1u << 31))) {
 +			break;
 +		}
 +		delay(2);
@@ -420,12 +447,10 @@ index 0000000..c637e25
 +
 +	gfx_cbcr = reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR);
 +	ahb_cbcr = reg_read(gcc_va, GCC_OXILI_AHB_CBCR);
-+	gmem_cbcr = reg_read(gcc_va, GCC_OXILI_GMEM_CBCR);
 +
-+	printf("adreno: step 5: clocks active (AHB=%#x [OFF=%u] GFX=%#x [OFF=%u] GMEM=%#x [OFF=%u] CMD=%#x CFG=%#x BIMC_GPU=%#x BIMC_GFX=%#x)\n",
++	printf("adreno: step 5: clocks active (AHB=%#x [OFF=%u] GFX=%#x [OFF=%u] CMD=%#x CFG=%#x BIMC_GPU=%#x BIMC_GFX=%#x)\n",
 +	    ahb_cbcr, (ahb_cbcr >> 31) & 1u,
 +	    gfx_cbcr, (gfx_cbcr >> 31) & 1u,
-+	    gmem_cbcr, (gmem_cbcr >> 31) & 1u,
 +	    reg_read(gcc_va, GCC_GFX3D_CMD_RCGR),
 +	    reg_read(gcc_va, GCC_GFX3D_CFG_RCGR),
 +	    reg_read(gcc_va, GCC_BIMC_GPU_CBCR),
@@ -585,7 +610,6 @@ index 0000000..c637e25
 +	reg_write(gcc_va, GCC_GFX3D_CMD_RCGR, reg_read(gcc_va, GCC_GFX3D_CMD_RCGR) | (1u << 1));
 +	reg_write(gcc_va, GCC_OXILI_AHB_CBCR, reg_read(gcc_va, GCC_OXILI_AHB_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_GFX3D_CBCR, reg_read(gcc_va, GCC_OXILI_GFX3D_CBCR) | 1u);
-+	reg_write(gcc_va, GCC_OXILI_GMEM_CBCR, reg_read(gcc_va, GCC_OXILI_GMEM_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_BIMC_GPU_CBCR, reg_read(gcc_va, GCC_BIMC_GPU_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_BIMC_GFX_CBCR, reg_read(gcc_va, GCC_BIMC_GFX_CBCR) | 1u);
 +	reg_write(gcc_va, GCC_OXILI_AON_CBCR, reg_read(gcc_va, GCC_OXILI_AON_CBCR) | 1u);
