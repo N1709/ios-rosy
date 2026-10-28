@@ -4129,7 +4129,7 @@ index 05294a8..c5375e5 100644
  	tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
 diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
 new file mode 100755
-index 0000000..78d59a2
+index 0000000..72b757c
 --- /dev/null
 +++ b/iokit/Kernel/arm/VinceGPU.cpp
 @@ -0,0 +1,521 @@
@@ -4153,7 +4153,7 @@ index 0000000..78d59a2
 +#include <sys/systm.h>
 +
 +extern "C" {
-+pmap_paddr_t kvtophys(vm_offset_t va);
++uint64_t kvtophys(vm_offset_t va);
 +bool vince_gpu_ready(void);
 +bool vince_gpu_parameter(uint32_t which, uint64_t *value);
 +uint32_t vince_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
