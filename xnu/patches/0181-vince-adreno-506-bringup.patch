@@ -4129,10 +4129,10 @@ index 05294a8..c5375e5 100644
  	tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
 diff --git a/iokit/Kernel/arm/VinceGPU.cpp b/iokit/Kernel/arm/VinceGPU.cpp
 new file mode 100755
-index 0000000..2f0e20f
+index 0000000..78d59a2
 --- /dev/null
 +++ b/iokit/Kernel/arm/VinceGPU.cpp
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,521 @@
 +/*
 + * VinceGPU: Adreno 506 GPU IOKit service for Vince (Xiaomi Redmi 5 Plus).
 + *
@@ -4153,6 +4153,7 @@ index 0000000..2f0e20f
 +#include <sys/systm.h>
 +
 +extern "C" {
++pmap_paddr_t kvtophys(vm_offset_t va);
 +bool vince_gpu_ready(void);
 +bool vince_gpu_parameter(uint32_t which, uint64_t *value);
 +uint32_t vince_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
@@ -4454,7 +4455,10 @@ index 0000000..2f0e20f
 +	bzero(b, sizeof(*b));
 +	b->memory = memory;
 +	b->kernel = (uint8_t *)memory->getBytesNoCopy();
-+	b->address = kvtophys((vm_offset_t)b->kernel);
++	b->address = memory->getPhysicalAddress();
++	if (b->address == 0) {
++		b->address = kvtophys((vm_offset_t)b->kernel);
++	}
 +	b->size = size;
 +	b->flags = request->flags;
 +	IOLockUnlock(gGPULock);
@@ -4646,7 +4650,7 @@ index 0000000..2f0e20f
 +
 +	if (args->structureOutput != NULL && args->structureOutputSize >= size) {
 +		memcpy(args->structureOutput, &r, size);
-+		args->structureOutputSize = size;
++		args->structureOutputSize = (uint32_t)size;
 +	}
 +	return ret;
 +}
